@@ -52,6 +52,7 @@ import { ImportExternalTexture } from "./ImportExternalTexture";
 import { VisionCamera } from "./VisionCamera";
 import { SixteenBitTextures } from "./SixteenBitTextures";
 import { ViewSnapshot } from "./ViewSnapshot";
+import { CanvasHandleProbe, CanvasLayoutProbe } from "./CanvasProbes";
 
 // The two lines below are needed by three.js
 import "fast-text-encoding";
@@ -69,10 +70,15 @@ function App() {
     <GestureHandlerRootView style={{ flex: 1 }}>
       <NavigationContainer>
         <Stack.Navigator
-          initialRouteName={CI ? "Tests" : "Home"}
+          initialRouteName={
+            (process.env.PROBE as keyof Routes | undefined) ??
+            (CI ? "Tests" : "Home")
+          }
           screenOptions={{ cardStyle: { flex: 1 } }}
         >
           <Stack.Screen name="Home" component={Home} />
+          <Stack.Screen name="CanvasLayoutProbe" component={CanvasLayoutProbe} />
+          <Stack.Screen name="CanvasHandleProbe" component={CanvasHandleProbe} />
           <Stack.Screen name="HelloTriangle" component={HelloTriangle} />
           <Stack.Screen
             name="HelloTriangleMSAA"

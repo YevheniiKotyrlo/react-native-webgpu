@@ -1,5 +1,7 @@
 export type Routes = {
   Home: undefined;
+  CanvasLayoutProbe: undefined;
+  CanvasHandleProbe: undefined;
   HelloTriangle: undefined;
   HelloTriangleMSAA: undefined;
   ImageBlur: undefined;

@@ -2,6 +2,7 @@ package com.webgpu;
 
 import android.content.Context;
 import android.os.Build;
+import android.view.Display;
 import android.view.Surface;
 import android.view.View;
 
@@ -129,12 +130,27 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     }
   }
 
+  private float resolveMaxRefreshRate() {
+    Display display = getDisplay();
+    if (display == null) {
+      return 0f;
+    }
+    float maxRefreshRate = 0f;
+    for (Display.Mode mode : display.getSupportedModes()) {
+      maxRefreshRate = Math.max(maxRefreshRate, mode.getRefreshRate());
+    }
+    return maxRefreshRate;
+  }
+
   @Override
   public void surfaceCreated(Surface surface) {
     float density = getResources().getDisplayMetrics().density;
     float width = getWidth() / density;
     float height = getHeight() / density;
-    onSurfaceCreate(surface, mContextId, width, height);
+    // Only a SurfaceView votes: it is a layer of its own, while a TextureView
+    // draws into its window's layer.
+    float maxRefreshRate = mAppliedKind == KIND_SURFACE_VIEW ? resolveMaxRefreshRate() : 0f;
+    onSurfaceCreate(surface, mContextId, width, height, maxRefreshRate);
   }
 
   @Override
@@ -168,7 +184,8 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     Surface surface,
     int contextId,
     float width,
-    float height
+    float height,
+    float maxRefreshRate
   );
 
   @DoNotStrip

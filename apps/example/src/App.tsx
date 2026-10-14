@@ -45,6 +45,7 @@ import { RenderAfterUnmount } from "./Diagnostics/RenderAfterUnmount";
 import { BackgroundDetach } from "./Diagnostics/BackgroundDetach";
 import { SurfaceChurn } from "./Diagnostics/SurfaceChurn";
 import { TransparencyMode } from "./Diagnostics/TransparencyMode";
+import { SurfaceFrameRate } from "./Diagnostics/SurfaceFrameRate";
 import { DeviceDestroyBeforeDetach } from "./Diagnostics/DeviceDestroyBeforeDetach";
 import { StorageBufferVertices } from "./StorageBufferVertices";
 import { SharedTextureMemory } from "./SharedTextureMemory";
@@ -132,6 +133,7 @@ function App() {
           <Stack.Screen name="BackgroundDetach" component={BackgroundDetach} />
           <Stack.Screen name="SurfaceChurn" component={SurfaceChurn} />
           <Stack.Screen name="TransparencyMode" component={TransparencyMode} />
+          <Stack.Screen name="SurfaceFrameRate" component={SurfaceFrameRate} />
           <Stack.Screen
             name="DeviceDestroyBeforeDetach"
             component={DeviceDestroyBeforeDetach}

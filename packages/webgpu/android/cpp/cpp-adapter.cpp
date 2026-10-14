@@ -17,6 +17,7 @@
 #include "AndroidPlatformContext.h"
 #include "GPUCanvasContext.h"
 #include "RNWebGPUManager.h"
+#include "SurfaceFrameRateVote.h"
 #include "WebGPURuntime.h"
 
 #define LOG_TAG "WebGPUModule"
@@ -106,7 +107,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceChanged(
 
 extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
     JNIEnv *env, jobject thiz, jobject jSurface, jint contextId, jfloat width,
-    jfloat height) {
+    jfloat height, jfloat maxRefreshRate) {
   if (manager == nullptr) {
     return;
   }
@@ -120,13 +121,23 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
   auto &runtime = rnwgpu::WebGPURuntime::shared();
   auto gpu = runtime.instance();
   auto surface = runtime.makeSurface(window);
+  // Only a SurfaceView passes a refresh rate: it is a layer of its own, while a
+  // TextureView draws into its window's layer.
+  rnwgpu::NativeSurfaceDidPresent didPresent;
+  if (maxRefreshRate > 0) {
+    auto frameRateVote = std::make_shared<rnwgpu::SurfaceFrameRateVote>();
+    frameRateVote->attach(window, maxRefreshRate);
+    didPresent = [frameRateVote]() { frameRateVote->onFramePresented(); };
+  }
   // Find-or-create + attach runs atomically under the registry lock so a
   // concurrent destroyContext cannot orphan this surface.
   auto info = registry.attachSurface(
       contextId, gpu, static_cast<int>(width), static_cast<int>(height), window,
-      surface, [](void *nativeSurface) {
+      surface,
+      [](void *nativeSurface) {
         ANativeWindow_release(static_cast<ANativeWindow *>(nativeSurface));
-      });
+      },
+      std::move(didPresent));
   // The attach is adopted at the next frame boundary by the rendering thread;
   // schedule a flush so contexts that are not currently rendering still pick
   // it up (and present their last offscreen frame).

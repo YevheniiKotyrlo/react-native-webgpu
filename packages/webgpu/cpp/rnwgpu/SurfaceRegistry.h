@@ -58,6 +58,12 @@ struct Size {
 // CAMetalLayer on Apple platforms). May run on any thread.
 using NativeSurfaceReleaser = std::function<void(void *)>;
 
+// Invoked after each frame presented to the native surface it was attached
+// with, on the thread that presented it and outside SurfaceInfo's lock
+// (Android's SurfaceView frame-rate vote). SurfaceInfo drops it together
+// with that surface.
+using NativeSurfaceDidPresent = std::function<void()>;
+
 #if defined(__ANDROID__)
 // --- AHB-pool presentation mode (WebGPUHardwareBufferView)
 // -----------------------------
@@ -184,20 +190,24 @@ public:
   // RNWebGPUManager::flushPendingSurfaceTransition so contexts that are not
   // currently rendering also pick it up.
   void attachSurface(void *nativeSurface, wgpu::Surface surface,
-                     NativeSurfaceReleaser releaser) {
+                     NativeSurfaceReleaser releaser,
+                     NativeSurfaceDidPresent didPresent = nullptr) {
     void *replacedSurface = nullptr;
     NativeSurfaceReleaser replacedReleaser;
+    NativeSurfaceDidPresent replacedDidPresent;
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (_hasPendingAttach) {
         // Replaced before it was ever adopted.
         replacedSurface = _pendingNativeSurface;
         replacedReleaser = std::move(_pendingReleaser);
+        replacedDidPresent = std::move(_pendingDidPresent);
       }
       _hasPendingAttach = true;
       _pendingNativeSurface = nativeSurface;
       _pendingSurface = std::move(surface);
       _pendingReleaser = std::move(releaser);
+      _pendingDidPresent = std::move(didPresent);
     }
     if (replacedReleaser && replacedSurface) {
       replacedReleaser(replacedSurface);
@@ -241,6 +251,7 @@ public:
     wgpu::Device device = nullptr;
     void *replacedSurface = nullptr;
     NativeSurfaceReleaser replacedReleaser;
+    NativeSurfaceDidPresent replacedDidPresent;
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (supersedeInFlightFrame) {
@@ -255,6 +266,7 @@ public:
       // can be null if surface creation failed).
       replacedSurface = _nativeSurface;
       replacedReleaser = std::move(_releaser);
+      replacedDidPresent = std::move(_didPresent);
       _surface = std::move(_pendingSurface);
 #if defined(__ANDROID__)
       // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE
@@ -262,6 +274,7 @@ public:
 #endif
       _nativeSurface = _pendingNativeSurface;
       _releaser = std::move(_pendingReleaser);
+      _didPresent = std::move(_pendingDidPresent);
       _hasPendingAttach = false;
       _pendingNativeSurface = nullptr;
       _frameEpoch++;
@@ -306,8 +319,13 @@ public:
       // or any other transition while we were unlocked skips this present
       // (their newer content stands; presenting here would be a Dawn
       // present-without-acquire error).
+      NativeSurfaceDidPresent didPresent;
       if (_surface && !_frameInFlight && _frameEpoch == blitEpoch) {
-        _surface.Present();
+        didPresent = presentSurfaceLocked();
+      }
+      lock.unlock();
+      if (didPresent) {
+        didPresent();
       }
     }
   }
@@ -549,14 +567,18 @@ public:
       dawn::native::metal::WaitForCommandsToBeScheduled(device.Get());
     }
 #endif
+    NativeSurfaceDidPresent didPresent;
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (_surface && _acquiredFromSurface) {
-        _surface.Present();
+        didPresent = presentSurfaceLocked();
       }
       _acquiredFromSurface = false;
       _frameInFlight = false;
       _frameEpoch++;
+    }
+    if (didPresent) {
+      didPresent();
     }
     applyPendingAttach();
   }
@@ -697,6 +719,7 @@ private:
   void detach(bool createFallbackTexture) {
     void *releasedSurfaces[2] = {nullptr, nullptr};
     NativeSurfaceReleaser releasers[2];
+    NativeSurfaceDidPresent releasedDidPresents[2];
 #if defined(__ANDROID__)
     // Destroyed outside the lock: it releases a JNI reference.
     std::function<void()> releasedFrameReady;
@@ -740,6 +763,7 @@ private:
         _pendingSurface = nullptr;
         releasedSurfaces[0] = _pendingNativeSurface;
         releasers[0] = std::move(_pendingReleaser);
+        releasedDidPresents[0] = std::move(_pendingDidPresent);
         _pendingNativeSurface = nullptr;
       }
       if (_surface) {
@@ -760,6 +784,7 @@ private:
       // be null if surface creation failed): always return the window.
       releasedSurfaces[1] = _nativeSurface;
       releasers[1] = std::move(_releaser);
+      releasedDidPresents[1] = std::move(_didPresent);
       _nativeSurface = nullptr;
     }
     // Release outside the lock: the platform may do real work here.
@@ -771,6 +796,15 @@ private:
   }
 
   // All *Locked helpers below require _mutex to be held exclusively.
+
+  // Returns the surface's didPresent callback when the present succeeded, for
+  // the caller to run once it has released the lock.
+  NativeSurfaceDidPresent presentSurfaceLocked() {
+    if (_surface.Present() == wgpu::Status::Success) {
+      return _didPresent;
+    }
+    return nullptr;
+  }
 
   wgpu::Texture createOffscreenTextureLocked() {
     wgpu::TextureDescriptor descriptor;
@@ -1201,6 +1235,7 @@ private:
   void *_nativeSurface = nullptr;
   wgpu::Surface _surface = nullptr;
   NativeSurfaceReleaser _releaser;
+  NativeSurfaceDidPresent _didPresent;
   // Offscreen fallback drawing buffer.
   wgpu::Texture _texture = nullptr;
   // Surface attached by the UI thread, awaiting adoption at a frame boundary.
@@ -1208,6 +1243,7 @@ private:
   void *_pendingNativeSurface = nullptr;
   wgpu::Surface _pendingSurface = nullptr;
   NativeSurfaceReleaser _pendingReleaser;
+  NativeSurfaceDidPresent _pendingDidPresent;
   // Frame state: set by getCurrentTexture, cleared by presentFrame.
   bool _frameInFlight = false;
   bool _acquiredFromSurface = false;
@@ -1298,14 +1334,15 @@ public:
   // an entry that a concurrent destroyContext is erasing (it either marks the
   // entry attached before the check, or re-creates the entry after the
   // erase). Lock order is registry -> SurfaceInfo, matching every other path.
-  std::shared_ptr<SurfaceInfo> attachSurface(int id, wgpu::Instance gpu,
-                                             int width, int height,
-                                             void *nativeSurface,
-                                             wgpu::Surface surface,
-                                             NativeSurfaceReleaser releaser) {
+  std::shared_ptr<SurfaceInfo>
+  attachSurface(int id, wgpu::Instance gpu, int width, int height,
+                void *nativeSurface, wgpu::Surface surface,
+                NativeSurfaceReleaser releaser,
+                NativeSurfaceDidPresent didPresent = nullptr) {
     std::unique_lock<std::shared_mutex> lock(_mutex);
     auto info = getSurfaceInfoOrCreateLocked(id, gpu, width, height);
-    info->attachSurface(nativeSurface, std::move(surface), std::move(releaser));
+    info->attachSurface(nativeSurface, std::move(surface), std::move(releaser),
+                        std::move(didPresent));
     return info;
   }
 

@@ -53,6 +53,10 @@ const tests = [
     screen: "DeviceDestroyBeforeDetach",
     title: "⚠️ Device Destroy Before Detach",
   },
+  {
+    screen: "SurfaceFrameRate",
+    title: "⚠️ SurfaceView Frame Rate",
+  },
 ] as const;
 
 export const DiagnosticsList = () => {

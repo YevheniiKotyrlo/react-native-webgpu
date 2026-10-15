@@ -63,6 +63,11 @@ final class FirstFrameDrawGate {
     }
   }
 
+  /** Whether surfaceToken names the surface the view has now. */
+  boolean hasSurface(long surfaceToken) {
+    return surfaceToken != 0 && surfaceToken == mSurfaceToken;
+  }
+
   /** A frame was presented into the surface surfaceToken names. */
   void onFirstFramePresented(long surfaceToken) {
     if (surfaceToken != mSurfaceToken) {

@@ -209,7 +209,7 @@ struct WeakViewMethod {
 extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
     JNIEnv *env, jobject thiz, jobject jSurface, jint contextId, jfloat width,
     jfloat height, jfloat maxRefreshRate, jlong firstFrameToken,
-    jboolean presentsBehindPendingDraw) {
+    jboolean presentsBehindPendingDraw, jboolean adoptsBeforeFirstDraw) {
   if (manager == nullptr) {
     return;
   }
@@ -262,6 +262,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
         ANativeWindow_release(static_cast<ANativeWindow *>(nativeSurface));
       },
       std::move(didPresent), std::move(presentPoster));
+  // A TextureView given its surface before its first draw shows the latest
+  // frame in that draw only if it is presented into the surface first.
+  if (adoptsBeforeFirstDraw) {
+    info->applyPendingAttach();
+  }
   // The attach is adopted at the next frame boundary by the rendering thread;
   // schedule a flush so contexts that are not currently rendering still pick
   // it up (and present their last offscreen frame).

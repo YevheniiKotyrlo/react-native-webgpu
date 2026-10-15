@@ -239,7 +239,10 @@ selects a `SurfaceView` there.
 `setOpaque`, and a `HardwareBufferView` always composites with alpha. Changing
 `opaque` at runtime updates the view in place, unless `surfaceType` is unset
 and the change moves the canvas between `SurfaceView` and `TextureView`; that,
-like changing `surfaceType` or `zOrderOnTop`, replaces the backing view.
+like changing `surfaceType` or `zOrderOnTop`, replaces the backing view. The
+canvas stays on screen through a replacement: a new `TextureView` shows the
+latest frame from its first draw, and a new `SurfaceView` stays under the
+outgoing `TextureView` until its own first frame is on screen.
 
 Android drops a surface's content with the surface: a `SurfaceView`'s when the
 app goes to the background, and any backing view's when it leaves the window

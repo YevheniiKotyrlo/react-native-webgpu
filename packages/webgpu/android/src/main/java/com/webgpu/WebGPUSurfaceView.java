@@ -3,6 +3,7 @@ package com.webgpu;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.graphics.Region;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
@@ -18,6 +19,7 @@ public class WebGPUSurfaceView extends SurfaceView implements SurfaceHolder.Call
   private static final AtomicLong sNextSurfaceToken = new AtomicLong();
 
   WebGPUAPI mApi;
+  private boolean mRetired = false;
   private final FirstFrameDrawGate mDrawGate = new FirstFrameDrawGate(new FirstFrameDrawGate.Host() {
     @Override
     public void postDelayed(Runnable action, long delayMillis) {
@@ -44,6 +46,21 @@ public class WebGPUSurfaceView extends SurfaceView implements SurfaceHolder.Call
     getHolder().setFormat(opaque ? PixelFormat.OPAQUE : PixelFormat.TRANSLUCENT);
   }
 
+  // The canvas moved to another view while this one stays attached and
+  // undrawn (BackingViewKind.retiresWhenReplaced): its surface leaves the
+  // renderer now, its draw reports are settled, and the view reports nothing
+  // more and punches no hole in the window.
+  void retire() {
+    releaseSurface();
+    mApi = WebGPUAPI.DETACHED;
+    mRetired = true;
+  }
+
+  @Override
+  public boolean gatherTransparentRegion(Region region) {
+    return mRetired || super.gatherTransparentRegion(region);
+  }
+
   @Override
   protected void onDetachedFromWindow() {
     mDrawGate.onDetachedFromWindow();
@@ -57,7 +74,7 @@ public class WebGPUSurfaceView extends SurfaceView implements SurfaceHolder.Call
   public void surfaceCreated(@NonNull SurfaceHolder holder) {
     long surfaceToken = sNextSurfaceToken.incrementAndGet();
     mDrawGate.onSurfaceCreated(surfaceToken);
-    mApi.surfaceCreated(holder.getSurface(), surfaceToken);
+    mApi.surfaceCreated(holder.getSurface(), surfaceToken, false);
   }
 
   @Override
@@ -80,6 +97,11 @@ public class WebGPUSurfaceView extends SurfaceView implements SurfaceHolder.Call
   @Override
   public void surfaceDestroyed(@NonNull SurfaceHolder holder) {
     releaseSurface();
+  }
+
+  /** Whether surfaceToken names the surface this view has now. Main thread. */
+  boolean hasSurface(long surfaceToken) {
+    return mDrawGate.hasSurface(surfaceToken);
   }
 
   /** A frame was presented into the surface surfaceToken names. Main thread. */

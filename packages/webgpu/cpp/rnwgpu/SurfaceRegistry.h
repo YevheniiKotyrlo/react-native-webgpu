@@ -58,6 +58,12 @@ struct Size {
 // CAMetalLayer on Apple platforms). May run on any thread.
 using NativeSurfaceReleaser = std::function<void(void *)>;
 
+// Invoked once, after the first present onto the native surface it was
+// attached with (a frame, or the blit of the latest offscreen frame), on the
+// thread that presented and outside SurfaceInfo's lock (Android's SurfaceView
+// first-frame report). SurfaceInfo drops it together with that surface.
+using NativeSurfaceFirstPresent = std::function<void()>;
+
 #if defined(__ANDROID__)
 // --- AHB-pool presentation mode (WebGPUNativeBufferView)
 // -----------------------------
@@ -184,20 +190,24 @@ public:
   // RNWebGPUManager::flushPendingSurfaceTransition so contexts that are not
   // currently rendering also pick it up.
   void attachSurface(void *nativeSurface, wgpu::Surface surface,
-                     NativeSurfaceReleaser releaser) {
+                     NativeSurfaceReleaser releaser,
+                     NativeSurfaceFirstPresent firstPresent = nullptr) {
     void *replacedSurface = nullptr;
     NativeSurfaceReleaser replacedReleaser;
+    NativeSurfaceFirstPresent replacedFirstPresent;
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (_hasPendingAttach) {
         // Replaced before it was ever adopted.
         replacedSurface = _pendingNativeSurface;
         replacedReleaser = std::move(_pendingReleaser);
+        replacedFirstPresent = std::move(_pendingFirstPresent);
       }
       _hasPendingAttach = true;
       _pendingNativeSurface = nativeSurface;
       _pendingSurface = std::move(surface);
       _pendingReleaser = std::move(releaser);
+      _pendingFirstPresent = std::move(firstPresent);
     }
     if (replacedReleaser && replacedSurface) {
       replacedReleaser(replacedSurface);
@@ -241,6 +251,8 @@ public:
     wgpu::Device device = nullptr;
     void *replacedSurface = nullptr;
     NativeSurfaceReleaser replacedReleaser;
+    NativeSurfaceFirstPresent replacedFirstPresent;
+    NativeSurfaceFirstPresent firstPresent;
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (supersedeInFlightFrame) {
@@ -255,6 +267,7 @@ public:
       // can be null if surface creation failed).
       replacedSurface = _nativeSurface;
       replacedReleaser = std::move(_releaser);
+      replacedFirstPresent = std::move(_firstPresent);
       _surface = std::move(_pendingSurface);
 #if defined(__ANDROID__)
       // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE
@@ -262,6 +275,7 @@ public:
 #endif
       _nativeSurface = _pendingNativeSurface;
       _releaser = std::move(_pendingReleaser);
+      _firstPresent = std::move(_pendingFirstPresent);
       _hasPendingAttach = false;
       _pendingNativeSurface = nullptr;
       _frameEpoch++;
@@ -308,7 +322,11 @@ public:
       // present-without-acquire error).
       if (_surface && !_frameInFlight && _frameEpoch == blitEpoch) {
         _surface.Present();
+        firstPresent = std::move(_firstPresent);
       }
+    }
+    if (firstPresent) {
+      firstPresent();
     }
   }
 
@@ -552,6 +570,7 @@ public:
 #if defined(__ANDROID__)
     std::function<void()> framePresented;
 #endif
+    NativeSurfaceFirstPresent firstPresent;
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (_surface && _acquiredFromSurface) {
@@ -559,6 +578,7 @@ public:
 #if defined(__ANDROID__)
         framePresented = _framePresented;
 #endif
+        firstPresent = std::move(_firstPresent);
       }
       _acquiredFromSurface = false;
       _frameInFlight = false;
@@ -569,6 +589,9 @@ public:
       framePresented();
     }
 #endif
+    if (firstPresent) {
+      firstPresent();
+    }
     applyPendingAttach();
   }
 
@@ -718,6 +741,8 @@ private:
   void detach(bool createFallbackTexture) {
     void *releasedSurfaces[2] = {nullptr, nullptr};
     NativeSurfaceReleaser releasers[2];
+    // Destroyed outside the lock, like the releasers.
+    NativeSurfaceFirstPresent droppedFirstPresents[2];
 #if defined(__ANDROID__)
     // Destroyed outside the lock: it releases a JNI reference.
     std::function<void()> releasedFrameReady;
@@ -761,8 +786,10 @@ private:
         _pendingSurface = nullptr;
         releasedSurfaces[0] = _pendingNativeSurface;
         releasers[0] = std::move(_pendingReleaser);
+        droppedFirstPresents[0] = std::move(_pendingFirstPresent);
         _pendingNativeSurface = nullptr;
       }
+      droppedFirstPresents[1] = std::move(_firstPresent);
       if (_surface) {
         if (createFallbackTexture && _config.device != nullptr) {
           _texture = createOffscreenTextureLocked();
@@ -871,14 +898,16 @@ private:
     return true;
   }
 
+  // Without a surface nothing is created: the offscreen texture appears with
+  // the first frame rendered into it (getCurrentTexture), so a surface that
+  // attaches before that frame is presented nothing rather than an empty
+  // frame, and a SurfaceView keeps its hole closed until the frame lands.
   void _configureLocked() {
     if (_surface) {
       configureSurfaceLocked(_config);
 #ifdef __APPLE__
       applyCAMetalLayerColorSpace(_nativeSurface, _config.format);
 #endif
-    } else {
-      _texture = createOffscreenTextureLocked();
     }
   }
 
@@ -1229,6 +1258,10 @@ private:
   void *_pendingNativeSurface = nullptr;
   wgpu::Surface _pendingSurface = nullptr;
   NativeSurfaceReleaser _pendingReleaser;
+  // See NativeSurfaceFirstPresent: the pending surface's, then the attached
+  // surface's until its first present takes it.
+  NativeSurfaceFirstPresent _pendingFirstPresent;
+  NativeSurfaceFirstPresent _firstPresent;
   // Frame state: set by getCurrentTexture, cleared by presentFrame.
   bool _frameInFlight = false;
   bool _acquiredFromSurface = false;
@@ -1326,10 +1359,13 @@ public:
                                              int width, int height,
                                              void *nativeSurface,
                                              wgpu::Surface surface,
-                                             NativeSurfaceReleaser releaser) {
+                                             NativeSurfaceReleaser releaser,
+                                             NativeSurfaceFirstPresent
+                                                 firstPresent = nullptr) {
     std::unique_lock<std::shared_mutex> lock(_mutex);
     auto info = getSurfaceInfoOrCreateLocked(id, gpu, width, height);
-    info->attachSurface(nativeSurface, std::move(surface), std::move(releaser));
+    info->attachSurface(nativeSurface, std::move(surface), std::move(releaser),
+                        std::move(firstPresent));
     return info;
   }
 

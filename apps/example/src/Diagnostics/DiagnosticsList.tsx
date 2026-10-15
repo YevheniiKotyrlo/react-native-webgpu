@@ -57,6 +57,10 @@ const tests = [
     screen: "SurfaceFrameRate",
     title: "⚠️ SurfaceView Frame Rate",
   },
+  {
+    screen: "FirstFrameHole",
+    title: "⚠️ SurfaceView First Frame",
+  },
 ] as const;
 
 export const DiagnosticsList = () => {

@@ -60,8 +60,8 @@ using NativeSurfaceReleaser = std::function<void(void *)>;
 
 // Invoked after each frame presented to the native surface it was attached
 // with, on the thread that presented it and outside SurfaceInfo's lock
-// (Android's SurfaceView frame-rate vote). SurfaceInfo drops it together
-// with that surface.
+// (Android's SurfaceView frame-rate vote and first-frame report). SurfaceInfo
+// drops it together with that surface.
 using NativeSurfaceDidPresent = std::function<void()>;
 
 #if defined(__ANDROID__)
@@ -946,14 +946,16 @@ private:
     _config.device.GetQueue().Submit(1, &commands);
   }
 
+  // Without a surface nothing is created: the offscreen texture appears with
+  // the first frame rendered into it (getCurrentTexture), so a surface that
+  // attaches before that frame is presented nothing rather than an empty
+  // frame, and a SurfaceView keeps its hole closed until the frame lands.
   void _configureLocked() {
     if (_surface) {
       configureSurfaceLocked(_config);
 #ifdef __APPLE__
       applyCAMetalLayerColorSpace(_nativeSurface, _config.format);
 #endif
-    } else {
-      _texture = createOffscreenTextureLocked();
     }
   }
 

@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -105,9 +106,63 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceChanged(
   }
 }
 
+namespace {
+
+// Reports a SurfaceView's first presented frame back to its WebGPUView, once,
+// from the thread that presented it: the view holds the window's draw report
+// until then (FirstFrameDrawGate). The view is held weakly: the surface, and
+// this with it, can outlive it.
+class FirstFramePresentedNotifier {
+public:
+  FirstFramePresentedNotifier(JNIEnv *env, jobject view, jlong firstFrameToken)
+      : _view(env->NewWeakGlobalRef(view)), _firstFrameToken(firstFrameToken) {
+    jclass cls = env->GetObjectClass(view);
+    _onFirstFramePresented =
+        env->GetMethodID(cls, "onFirstFramePresented", "(J)V");
+    env->DeleteLocalRef(cls);
+  }
+
+  ~FirstFramePresentedNotifier() {
+    // May run on any thread the surface is released from.
+    facebook::jni::ThreadScope scope;
+    JNIEnv *env = facebook::jni::Environment::current();
+    if (env != nullptr && _view != nullptr) {
+      env->DeleteWeakGlobalRef(_view);
+    }
+  }
+
+  void onFramePresented() {
+    if (_reported.exchange(true)) {
+      return;
+    }
+    facebook::jni::ThreadScope scope;
+    JNIEnv *env = facebook::jni::Environment::current();
+    if (env == nullptr || _onFirstFramePresented == nullptr) {
+      return;
+    }
+    jobject local = env->NewLocalRef(_view);
+    if (local == nullptr) {
+      return; // the view was garbage collected
+    }
+    env->CallVoidMethod(local, _onFirstFramePresented, _firstFrameToken);
+    if (env->ExceptionCheck()) {
+      env->ExceptionClear();
+    }
+    env->DeleteLocalRef(local);
+  }
+
+private:
+  jweak _view;
+  jmethodID _onFirstFramePresented = nullptr;
+  jlong _firstFrameToken;
+  std::atomic<bool> _reported{false};
+};
+
+} // namespace
+
 extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
     JNIEnv *env, jobject thiz, jobject jSurface, jint contextId, jfloat width,
-    jfloat height, jfloat maxRefreshRate) {
+    jfloat height, jfloat maxRefreshRate, jlong firstFrameToken) {
   if (manager == nullptr) {
     return;
   }
@@ -123,11 +178,27 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
   auto surface = runtime.makeSurface(window);
   // Only a SurfaceView passes a refresh rate: it is a layer of its own, while a
   // TextureView draws into its window's layer.
-  rnwgpu::NativeSurfaceDidPresent didPresent;
+  std::shared_ptr<rnwgpu::SurfaceFrameRateVote> frameRateVote;
   if (maxRefreshRate > 0) {
-    auto frameRateVote = std::make_shared<rnwgpu::SurfaceFrameRateVote>();
+    frameRateVote = std::make_shared<rnwgpu::SurfaceFrameRateVote>();
     frameRateVote->attach(window, maxRefreshRate);
-    didPresent = [frameRateVote]() { frameRateVote->onFramePresented(); };
+  }
+  // Only a SurfaceView behind its window waits for its first frame.
+  std::shared_ptr<FirstFramePresentedNotifier> firstFrameNotifier;
+  if (firstFrameToken != 0) {
+    firstFrameNotifier = std::make_shared<FirstFramePresentedNotifier>(
+        env, thiz, firstFrameToken);
+  }
+  rnwgpu::NativeSurfaceDidPresent didPresent;
+  if (frameRateVote || firstFrameNotifier) {
+    didPresent = [frameRateVote, firstFrameNotifier]() {
+      if (frameRateVote) {
+        frameRateVote->onFramePresented();
+      }
+      if (firstFrameNotifier) {
+        firstFrameNotifier->onFramePresented();
+      }
+    };
   }
   // Find-or-create + attach runs atomically under the registry lock so a
   // concurrent destroyContext cannot orphan this surface.

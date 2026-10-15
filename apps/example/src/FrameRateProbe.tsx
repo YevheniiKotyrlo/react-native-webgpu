@@ -26,13 +26,23 @@ const renderLoop = (
   let windowStart = Date.now();
   let framesInWindow = 0;
   const render = () => {
-    const phase = (frame++ % 240) / 240;
+    const hues = [
+      [1, 0, 0, 1],
+      [1, 0.5, 0, 1],
+      [1, 1, 0, 1],
+      [0, 1, 0, 1],
+      [0, 1, 1, 1],
+      [0, 0, 1, 1],
+      [0.5, 0, 1, 1],
+      [1, 0, 1, 1],
+    ];
+    const hue = hues[frame++ % hues.length];
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
           view: context.getCurrentTexture().createView(),
-          clearValue: [phase, 0.3, 1 - phase, 1],
+          clearValue: hue,
           loadOp: "clear",
           storeOp: "store",
         },

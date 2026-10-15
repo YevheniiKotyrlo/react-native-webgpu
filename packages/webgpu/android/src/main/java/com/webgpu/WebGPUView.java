@@ -2,6 +2,8 @@ package com.webgpu;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Display;
 import android.view.Surface;
 import android.view.View;
@@ -25,6 +27,10 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
   private boolean mAppliedZOrderOnTop;
   private WebGPUModule mModule;
   private View mView = null;
+  // Native posts a frame presented on the main thread here, to present it
+  // behind the draw the window has pending (see SurfaceRegistry.h).
+  private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+  private final Runnable mPostedPresent = () -> presentPostedFrame(mContextId);
 
   WebGPUView(Context context) {
     super(context);
@@ -150,7 +156,10 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     // Only a SurfaceView votes: it is a layer of its own, while a TextureView
     // draws into its window's layer.
     float maxRefreshRate = mAppliedKind == KIND_SURFACE_VIEW ? resolveMaxRefreshRate() : 0f;
-    onSurfaceCreate(surface, mContextId, width, height, maxRefreshRate, firstFrameToken);
+    // A TextureView shows a new frame only when its window draws.
+    boolean presentsBehindPendingDraw = mAppliedKind == KIND_TEXTURE_VIEW;
+    onSurfaceCreate(
+      surface, mContextId, width, height, maxRefreshRate, firstFrameToken, presentsBehindPendingDraw);
   }
 
   /**
@@ -164,6 +173,12 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
         ((WebGPUSurfaceView) mView).onFirstFramePresented(firstFrameToken);
       }
     });
+  }
+
+  /** Called by native on the main thread, see mPostedPresent. */
+  @DoNotStrip
+  private void postPresentBehindPendingDraw() {
+    mMainHandler.post(mPostedPresent);
   }
 
   @Override
@@ -199,7 +214,8 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     float width,
     float height,
     float maxRefreshRate,
-    long firstFrameToken
+    long firstFrameToken,
+    boolean presentsBehindPendingDraw
   );
 
   @DoNotStrip
@@ -209,6 +225,9 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     float width,
     float height
   );
+
+  @DoNotStrip
+  private native void presentPostedFrame(int contextId);
 
   @DoNotStrip
   private native void switchToOffscreenSurface(int contextId);

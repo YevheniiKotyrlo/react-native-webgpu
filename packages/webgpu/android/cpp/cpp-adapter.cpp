@@ -158,11 +158,58 @@ private:
   std::atomic<bool> _reported{false};
 };
 
+// A no-argument void method of a view, called from native through a weak
+// reference, so that a view RN has dropped is not kept alive by a
+// SurfaceInfo that outlives it (the registry keeps the SurfaceInfo until
+// onDropViewInstance).
+struct WeakViewMethod {
+  jweak view = nullptr;
+  jmethodID method = nullptr;
+
+  WeakViewMethod(JNIEnv *env, jobject thiz, const char *name) {
+    view = env->NewWeakGlobalRef(thiz);
+    jclass cls = env->GetObjectClass(thiz);
+    method = env->GetMethodID(cls, name, "()V");
+    env->DeleteLocalRef(cls);
+  }
+
+  ~WeakViewMethod() {
+    // May run on any thread; ThreadScope attaches if needed.
+    facebook::jni::ThreadScope scope;
+    JNIEnv *env = facebook::jni::Environment::current();
+    if (env != nullptr && view != nullptr) {
+      env->DeleteWeakGlobalRef(view);
+    }
+  }
+
+  // Returns whether the view was there to take the call. Called outside
+  // SurfaceInfo's locks.
+  bool operator()() const {
+    facebook::jni::ThreadScope scope;
+    JNIEnv *env = facebook::jni::Environment::current();
+    if (env == nullptr || method == nullptr) {
+      return false;
+    }
+    jobject local = env->NewLocalRef(view);
+    if (local == nullptr) {
+      return false; // the view was garbage collected
+    }
+    env->CallVoidMethod(local, method);
+    const bool called = !env->ExceptionCheck();
+    if (!called) {
+      env->ExceptionClear();
+    }
+    env->DeleteLocalRef(local);
+    return called;
+  }
+};
+
 } // namespace
 
 extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
     JNIEnv *env, jobject thiz, jobject jSurface, jint contextId, jfloat width,
-    jfloat height, jfloat maxRefreshRate, jlong firstFrameToken) {
+    jfloat height, jfloat maxRefreshRate, jlong firstFrameToken,
+    jboolean presentsBehindPendingDraw) {
   if (manager == nullptr) {
     return;
   }
@@ -200,6 +247,12 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
       }
     };
   }
+  rnwgpu::NativeSurfacePresentPoster presentPoster;
+  if (presentsBehindPendingDraw) {
+    auto postPresent = std::make_shared<WeakViewMethod>(
+        env, thiz, "postPresentBehindPendingDraw");
+    presentPoster = [postPresent]() { return (*postPresent)(); };
+  }
   // Find-or-create + attach runs atomically under the registry lock so a
   // concurrent destroyContext cannot orphan this surface.
   auto info = registry.attachSurface(
@@ -208,11 +261,20 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
       [](void *nativeSurface) {
         ANativeWindow_release(static_cast<ANativeWindow *>(nativeSurface));
       },
-      std::move(didPresent));
+      std::move(didPresent), std::move(presentPoster));
   // The attach is adopted at the next frame boundary by the rendering thread;
   // schedule a flush so contexts that are not currently rendering still pick
   // it up (and present their last offscreen frame).
   manager->flushPendingSurfaceTransition(info);
+}
+
+// The present WebGPUView.postPresentBehindPendingDraw posted (UI thread).
+extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_presentPostedFrame(
+    JNIEnv *env, jobject thiz, jint contextId) {
+  auto &registry = rnwgpu::SurfaceRegistry::getInstance();
+  if (auto info = registry.getSurfaceInfo(contextId)) {
+    info->presentPostedFrame();
+  }
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -240,53 +302,6 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onViewDestroyed(
 // --- WebGPUHardwareBufferView (AHB-pool presentation)
 // ---------------------------------
 
-namespace {
-
-// Weak handle on a WebGPUHardwareBufferView used by the native fence waiter to
-// wake the UI thread when a frame is ready. Holding it weakly means a view that
-// RN has dropped is not kept alive by a SurfaceInfo that outlives it (the
-// registry keeps the SurfaceInfo until onDropViewInstance).
-struct HardwareBufferViewWaker {
-  jweak view = nullptr;
-  jmethodID onFrameReady = nullptr;
-
-  HardwareBufferViewWaker(JNIEnv *env, jobject thiz) {
-    view = env->NewWeakGlobalRef(thiz);
-    jclass cls = env->GetObjectClass(thiz);
-    onFrameReady = env->GetMethodID(cls, "onNativeFrameReady", "()V");
-    env->DeleteLocalRef(cls);
-  }
-
-  ~HardwareBufferViewWaker() {
-    // May run on the waiter or JS thread; ThreadScope attaches if needed.
-    facebook::jni::ThreadScope scope;
-    JNIEnv *env = facebook::jni::Environment::current();
-    if (env != nullptr && view != nullptr) {
-      env->DeleteWeakGlobalRef(view);
-    }
-  }
-
-  // Called on the waiter thread, outside the pool lock.
-  void operator()() const {
-    facebook::jni::ThreadScope scope;
-    JNIEnv *env = facebook::jni::Environment::current();
-    if (env == nullptr || onFrameReady == nullptr) {
-      return;
-    }
-    jobject local = env->NewLocalRef(view);
-    if (local == nullptr) {
-      return; // the view was garbage collected
-    }
-    env->CallVoidMethod(local, onFrameReady);
-    if (env->ExceptionCheck()) {
-      env->ExceptionClear();
-    }
-    env->DeleteLocalRef(local);
-  }
-};
-
-} // namespace
-
 // Turn on pool mode for this context. dpW/dpH is the canvas-client (dp) size;
 // the native pool buffers are sized from the canvas drawing buffer lazily.
 extern "C" JNIEXPORT void JNICALL
@@ -297,7 +312,10 @@ Java_com_webgpu_WebGPUHardwareBufferView_nEnablePool(JNIEnv *env, jobject thiz,
   auto info = registry.getSurfaceInfoOrCreate(
       contextId, rnwgpu::WebGPURuntime::shared().instance(),
       static_cast<int>(dpW), static_cast<int>(dpH));
-  auto waker = std::make_shared<HardwareBufferViewWaker>(env, thiz);
+  // The native fence waiter wakes the UI thread through it when a frame is
+  // ready.
+  auto waker =
+      std::make_shared<WeakViewMethod>(env, thiz, "onNativeFrameReady");
   info->setPoolFrameReadyCallback([waker]() { (*waker)(); });
   info->enablePool(static_cast<int>(dpW), static_cast<int>(dpH));
   // The latest frame is published into the pool at the next frame boundary;

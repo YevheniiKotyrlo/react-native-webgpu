@@ -2,6 +2,8 @@ package com.webgpu;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Surface;
 import android.view.View;
 
@@ -24,6 +26,10 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
   private boolean mAppliedZOrderOnTop;
   private WebGPUModule mModule;
   private View mView = null;
+  // Native posts a frame presented on the main thread here, to present it
+  // behind the draw the window has pending (see SurfaceRegistry.h).
+  private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+  private final Runnable mPostedPresent = () -> presentPostedFrame(mContextId);
 
   WebGPUView(Context context) {
     super(context);
@@ -134,7 +140,8 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     float density = getResources().getDisplayMetrics().density;
     float width = getWidth() / density;
     float height = getHeight() / density;
-    onSurfaceCreate(surface, mContextId, width, height);
+    // A TextureView shows a new frame only when its window draws.
+    onSurfaceCreate(surface, mContextId, width, height, mAppliedKind == KIND_TEXTURE_VIEW);
   }
 
   @Override
@@ -155,6 +162,12 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     return mContextId;
   }
 
+  /** Called by native on the main thread, see mPostedPresent. */
+  @DoNotStrip
+  private void postPresentBehindPendingDraw() {
+    mMainHandler.post(mPostedPresent);
+  }
+
   /**
    * Called from WebGPUViewManager.onDropViewInstance when React removes this
    * view: the view dies with its Canvas, so it retires the registry entry.
@@ -168,7 +181,8 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     Surface surface,
     int contextId,
     float width,
-    float height
+    float height,
+    boolean presentsBehindPendingDraw
   );
 
   @DoNotStrip
@@ -178,6 +192,9 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     float width,
     float height
   );
+
+  @DoNotStrip
+  private native void presentPostedFrame(int contextId);
 
   @DoNotStrip
   private native void switchToOffscreenSurface(int contextId);

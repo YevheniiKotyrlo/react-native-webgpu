@@ -147,10 +147,16 @@ struct AHBPool {
 //   the surface as soon as its callback returns. A configured context falls
 //   back to rendering into an offscreen texture, so a running render loop
 //   keeps working; the in-flight frame, if any, is dropped at present(). When
-//   a new surface attaches, the latest offscreen frame is blitted onto it so
-//   content appears without waiting for the next render — the same mechanism
-//   that gives a fast time-to-first-frame when rendering starts before the
-//   native surface exists.
+//   a new surface attaches, the latest frame is blitted onto it so content
+//   appears without waiting for the next render — the same mechanism that
+//   gives a fast time-to-first-frame when rendering starts before the native
+//   surface exists. On Android the latest frame includes the last one
+//   presented: Android drops a surface's buffers with the surface (a
+//   SurfaceView in the background, any backing view that leaves the window or
+//   is replaced) and the pool drops its buffers when its view detaches, so
+//   presentFrame keeps a copy of each frame it presents, a pool enabled again
+//   starts from it too, and a canvas that stopped drawing comes back with its
+//   content.
 class SurfaceInfo {
 public:
   SurfaceInfo(wgpu::Instance gpu, int width, int height)
@@ -168,6 +174,7 @@ public:
     }
 #endif
     // Drop the Dawn objects before releasing the native surfaces they borrow.
+    _acquiredSurfaceTexture = nullptr;
     _surface = nullptr;
 #if defined(__ANDROID__)
     // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE
@@ -214,15 +221,15 @@ public:
     }
   }
 
-  // The platform surface is being destroyed: detach immediately. If the
-  // context is configured, rendering continues into an offscreen texture whose
-  // content is blitted to the next attached surface; present() no-ops until
-  // then. Safe to call when already offscreen.
-  void switchToOffscreen() { detach(/* createFallbackTexture = */ true); }
+  // The platform surface is being destroyed: detach immediately. The latest
+  // frame stays in the offscreen texture, rendering continues into it, and it
+  // is blitted onto the next attached surface; present() no-ops until then.
+  // Safe to call when already offscreen.
+  void switchToOffscreen() { detach(/* keepLatestFrame = */ true); }
 
-  // Detach without creating the offscreen fallback: used when the context is
-  // being destroyed and nothing will consume further frames.
-  void detachSurface() { detach(/* createFallbackTexture = */ false); }
+  // Detach and drop the latest frame: used when the context is being
+  // destroyed and nothing will consume further frames.
+  void detachSurface() { detach(/* keepLatestFrame = */ false); }
 
   // Reflects native view layout changes. Does not resize the drawing buffer:
   // that tracks canvas.width/height (like on the web), see
@@ -237,8 +244,9 @@ public:
   // RNWebGPUManager::flushPendingSurfaceTransition) ---------------------------
 
   // Adopt a pending surface if no frame is in flight: configure it and, if
-  // frames were rendered offscreen, blit the most recent one onto it and
-  // present it, so content shows up without waiting for the render loop.
+  // there is a latest frame (rendered offscreen, or retained from the previous
+  // surface), blit it onto the new one and present it, so content shows up
+  // without waiting for the render loop.
   // Safe to call from any thread; no-ops when there is nothing pending.
   //
   // supersedeInFlightFrame is set by the rendering thread when it starts a new
@@ -256,8 +264,14 @@ public:
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (supersedeInFlightFrame) {
         _frameInFlight = false;
-        _acquiredFromSurface = false;
+        _acquiredSurfaceTexture = nullptr;
       }
+#if defined(__ANDROID__)
+      if (_hasPendingPoolPublish && !_frameInFlight) {
+        _hasPendingPoolPublish = false;
+        publishLatestFrameToPoolLocked();
+      }
+#endif
       if (!_hasPendingAttach || _frameInFlight) {
         return;
       }
@@ -290,15 +304,21 @@ public:
         if (blit) {
           config.usage |= wgpu::TextureUsage::CopyDst;
         }
-        configureSurfaceLocked(config);
+        wgpu::TextureUsage surfaceUsage = configureSurfaceLocked(config);
 #ifdef __APPLE__
         applyCAMetalLayerColorSpace(_nativeSurface, _config.format);
 #endif
-        if (blit) {
+        // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE: the configure
+        // may have replaced the surface and failed to create a new one.
+        if (blit && _surface) {
           presentBlit = blitOffscreenToSurfaceLocked();
           device = _config.device;
-          // Consumed either way; on failure the next frame renders fresh.
-          _texture = nullptr;
+          // A surface that retains its frames now shows this one, so it stays
+          // the latest frame until the next present replaces it. Otherwise it
+          // is consumed either way; on failure the next frame renders fresh.
+          if (!retainsPresentedFrames(surfaceUsage)) {
+            _texture = nullptr;
+          }
           blitEpoch = _frameEpoch;
         }
       }
@@ -388,7 +408,7 @@ public:
     _texture = nullptr;
     _config = {};
     _viewFormats.clear();
-    _acquiredFromSurface = false;
+    _acquiredSurfaceTexture = nullptr;
     _frameEpoch++;
 #if defined(__ANDROID__)
     {
@@ -424,6 +444,11 @@ public:
   void releaseSurfaceForDevice(const wgpu::Device &device) {
 #if defined(__ANDROID__)
     std::unique_lock<std::shared_mutex> lock(_mutex);
+    // The latest frame belongs to the device too, and nothing can show it once
+    // the device is gone.
+    if (_config.device && _config.device.Get() == device.Get()) {
+      _texture = nullptr;
+    }
     {
       // The pool's SharedTextureMemory imports belong to the device too: drop
       // them while it is alive. The next getCurrentTexture() after a configure
@@ -489,7 +514,7 @@ public:
       if (auto texture = poolGetCurrentTexture()) {
         std::unique_lock<std::shared_mutex> lock(_mutex);
         _frameInFlight = true;
-        _acquiredFromSurface = false;
+        _acquiredSurfaceTexture = nullptr;
         _frameEpoch++;
         if (frameEpoch) {
           *frameEpoch = _frameEpoch;
@@ -509,7 +534,7 @@ public:
           "not configured; call context.configure() first");
     }
     _frameInFlight = true;
-    _acquiredFromSurface = false;
+    _acquiredSurfaceTexture = nullptr;
     _frameEpoch++;
     if (frameEpoch) {
       *frameEpoch = _frameEpoch;
@@ -517,7 +542,7 @@ public:
     if (_surface) {
       auto texture = acquireSurfaceTextureLocked();
       if (texture) {
-        _acquiredFromSurface = true;
+        _acquiredSurfaceTexture = texture;
         return texture;
       }
       // The surface is transiently unusable (e.g. mid-resize, lost while
@@ -545,14 +570,16 @@ public:
   // getCurrentTexture/submit (main JS, Reanimated UI, or a worklet runtime),
   // preserving Dawn surface thread-affinity. Frames whose texture was not
   // acquired from the attached surface (offscreen, detached mid-frame, or
-  // acquire failure) are dropped. This is also the end-of-frame boundary: it
-  // adopts a surface that attached while the frame was in flight.
+  // acquire failure) are dropped. A presented frame is first kept as the
+  // latest frame (retainFrameLocked). This is also the end-of-frame boundary:
+  // it adopts a surface that attached while the frame was in flight.
   void presentFrame() {
 #if defined(__ANDROID__)
     if (_poolMode.load()) {
       // Ends access on the pool slot and hands it to the fence waiter; the
       // view picks it up once its render-complete fence signals.
-      poolPresent();
+      std::unique_lock<std::shared_mutex> lock(_mutex);
+      poolPresentLocked();
     }
 #endif
 #ifdef __APPLE__
@@ -570,10 +597,11 @@ public:
     NativeSurfaceDidPresent didPresent;
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
-      if (_surface && _acquiredFromSurface) {
+      if (_surface && _acquiredSurfaceTexture) {
+        retainFrameLocked(_acquiredSurfaceTexture);
         didPresent = presentSurfaceLocked();
       }
-      _acquiredFromSurface = false;
+      _acquiredSurfaceTexture = nullptr;
       _frameInFlight = false;
       _frameEpoch++;
     }
@@ -606,11 +634,15 @@ public:
   // Turn on pool mode for this context. dpW/dpH is the canvas-client (dp) size
   // reported to JS via getSize(); the actual buffers are sized in pool px from
   // the canvas drawing buffer in poolResize().
+  // The latest frame is published into the pool at the next frame boundary
+  // (applyPendingAttach); callers should follow up with
+  // RNWebGPUManager::flushPendingSurfaceTransition, as for a surface attach.
   void enablePool(int dpW, int dpH) {
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       _width = dpW;
       _height = dpH;
+      _hasPendingPoolPublish = true;
     }
     std::lock_guard<std::mutex> poolLock(_poolMutex);
     _poolMode.store(true);
@@ -716,7 +748,7 @@ public:
 #endif
 
 private:
-  void detach(bool createFallbackTexture) {
+  void detach(bool keepLatestFrame) {
     void *releasedSurfaces[2] = {nullptr, nullptr};
     NativeSurfaceReleaser releasers[2];
     NativeSurfaceDidPresent releasedDidPresents[2];
@@ -728,8 +760,8 @@ private:
       std::unique_lock<std::shared_mutex> lock(_mutex);
 #if defined(__ANDROID__)
       // Leaving pool mode (the WebGPUHardwareBufferView detached): drop the
-      // pool. A configured context keeps rendering into the offscreen
-      // fallback, exactly like the surface path.
+      // pool. A configured context keeps rendering offscreen, exactly like
+      // the surface path.
       if (_poolMode.load()) {
         _poolMode.store(false);
         {
@@ -750,9 +782,6 @@ private:
           releasedFrameReady = std::move(_poolFrameReady);
           _poolFrameReady = nullptr;
         }
-        if (createFallbackTexture && _config.device != nullptr && !_texture) {
-          _texture = createOffscreenTextureLocked();
-        }
         _frameEpoch++;
       }
 #endif
@@ -767,9 +796,6 @@ private:
         _pendingNativeSurface = nullptr;
       }
       if (_surface) {
-        if (createFallbackTexture && _config.device != nullptr) {
-          _texture = createOffscreenTextureLocked();
-        }
         _surface = nullptr;
 #if defined(__ANDROID__)
         // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE
@@ -777,7 +803,10 @@ private:
 #endif
         // The in-flight frame (if any) rendered into the destroyed surface;
         // presentFrame() must not present it.
-        _acquiredFromSurface = false;
+        _acquiredSurfaceTexture = nullptr;
+      }
+      if (!keepLatestFrame) {
+        _texture = nullptr;
       }
       _frameEpoch++;
       // Window ownership is independent of the Dawn surface handle (which can
@@ -810,10 +839,11 @@ private:
     wgpu::TextureDescriptor descriptor;
     // Union with the user's usage so offscreen frames stay compatible with
     // whatever they configured (e.g. CopySrc readbacks). RenderAttachment |
-    // CopySrc | TextureBinding is what the fallback itself needs (rendering,
-    // the attach blit, sampling).
+    // CopySrc | CopyDst | TextureBinding is what the fallback itself needs
+    // (rendering, the attach blit, retaining a presented frame, sampling).
     descriptor.usage = _config.usage | wgpu::TextureUsage::RenderAttachment |
                        wgpu::TextureUsage::CopySrc |
+                       wgpu::TextureUsage::CopyDst |
                        wgpu::TextureUsage::TextureBinding;
     descriptor.format = _config.format;
     descriptor.size.width = std::max(1u, _config.width);
@@ -855,25 +885,58 @@ private:
            surfaceTexture.texture != nullptr;
   }
 
-  // Copy the last offscreen frame onto the freshly attached surface. Returns
-  // true when the copy was submitted and the surface should be presented.
+  // Copy the latest frame onto the freshly attached surface. Returns true
+  // when the copy was submitted and the surface should be presented.
   bool blitOffscreenToSurfaceLocked() {
     wgpu::SurfaceTexture surfaceTexture;
     _surface.GetCurrentTexture(&surfaceTexture);
     if (!isAcquireSuccess(surfaceTexture)) {
       return false;
     }
+    submitCopyLocked(_texture, surfaceTexture.texture);
+    return true;
+  }
 
+  // True when frames presented from textures with `usage` are kept in
+  // _texture (retainFrameLocked): on Android, which drops a surface's or a
+  // pool's buffers with it, as long as the texture allows the copy.
+  static bool retainsPresentedFrames(wgpu::TextureUsage usage) {
+#if defined(__ANDROID__)
+    return (usage & wgpu::TextureUsage::CopySrc) == wgpu::TextureUsage::CopySrc;
+#else
+    (void)usage;
+    return false;
+#endif
+  }
+
+  // Keep `frame`, which is about to be presented, as the latest frame: it is
+  // what the next surface or pool starts from once this one is gone. A frame
+  // that cannot be kept drops the older one instead, so no stale frame is
+  // shown later.
+  void retainFrameLocked(const wgpu::Texture &frame) {
+    if (!retainsPresentedFrames(frame.GetUsage()) ||
+        frame.GetFormat() != _config.format) {
+      _texture = nullptr;
+      return;
+    }
+    if (!_texture) {
+      _texture = createOffscreenTextureLocked();
+    }
+    submitCopyLocked(frame, _texture);
+  }
+
+  void submitCopyLocked(const wgpu::Texture &sourceTexture,
+                        const wgpu::Texture &destinationTexture) {
     wgpu::TexelCopyTextureInfo source = {};
-    source.texture = _texture;
+    source.texture = sourceTexture;
     wgpu::TexelCopyTextureInfo destination = {};
-    destination.texture = surfaceTexture.texture;
+    destination.texture = destinationTexture;
 
-    // The offscreen frame and the new surface can disagree on size (e.g. the
-    // device rotated while detached); copy the shared region.
+    // The latest frame and the surface can disagree on size (e.g. the device
+    // rotated while detached); copy the shared region.
     wgpu::Extent3D size = {
-        std::min(_texture.GetWidth(), surfaceTexture.texture.GetWidth()),
-        std::min(_texture.GetHeight(), surfaceTexture.texture.GetHeight()), 1};
+        std::min(sourceTexture.GetWidth(), destinationTexture.GetWidth()),
+        std::min(sourceTexture.GetHeight(), destinationTexture.GetHeight()), 1};
 
     wgpu::CommandEncoderDescriptor encoderDescriptor;
     wgpu::CommandEncoder encoder =
@@ -881,7 +944,6 @@ private:
     encoder.CopyTextureToTexture(&source, &destination, &size);
     wgpu::CommandBuffer commands = encoder.Finish();
     _config.device.GetQueue().Submit(1, &commands);
-    return true;
   }
 
   void _configureLocked() {
@@ -895,10 +957,12 @@ private:
     }
   }
 
-  // Every Surface::Configure goes through here. Once the
-  // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE lines are gone, this
-  // is a plain wrapper around _surface.Configure.
-  void configureSurfaceLocked(const wgpu::SurfaceConfiguration &config) {
+  // Every Surface::Configure goes through here. On Android it adds CopySrc
+  // when the surface supports it, so presentFrame can retain each frame.
+  // Returns the usage the surface was configured with (None when there is no
+  // surface to configure).
+  wgpu::TextureUsage
+  configureSurfaceLocked(const wgpu::SurfaceConfiguration &config) {
 #if defined(__ANDROID__)
     // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE
     // Vulkan refuses to switch a surface to another device and keeps the old
@@ -908,14 +972,24 @@ private:
     if (_surfaceDevice && _surfaceDevice.Get() != config.device.Get()) {
       recreateSurfaceLocked();
       if (!_surface) {
-        return;
+        return wgpu::TextureUsage::None;
       }
     }
-#endif
-    _surface.Configure(&config);
-#if defined(__ANDROID__)
+    wgpu::SurfaceConfiguration retainingConfig = config;
+    wgpu::SurfaceCapabilities capabilities;
+    if (_surface.GetCapabilities(config.device.GetAdapter(), &capabilities) ==
+            wgpu::Status::Success &&
+        (capabilities.usages & wgpu::TextureUsage::CopySrc) ==
+            wgpu::TextureUsage::CopySrc) {
+      retainingConfig.usage |= wgpu::TextureUsage::CopySrc;
+    }
+    _surface.Configure(&retainingConfig);
     // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE
     _surfaceDevice = config.device;
+    return retainingConfig.usage;
+#else
+    _surface.Configure(&config);
+    return config.usage;
 #endif
   }
 
@@ -928,7 +1002,7 @@ private:
     _surface = nullptr;
     _surfaceDevice = nullptr;
     // A frame acquired from the old surface can no longer be presented.
-    _acquiredFromSurface = false;
+    _acquiredSurfaceTexture = nullptr;
     _frameEpoch++;
     if (_nativeSurface) {
       wgpu::SurfaceSourceAndroidNativeWindow source;
@@ -1008,9 +1082,14 @@ private:
                          static_cast<unsigned long long>(wanted),
                          static_cast<unsigned long long>(usage));
       }
+      // CopySrc keeps each presented frame (poolPresentLocked) and CopyDst
+      // shows the latest frame in a pool enabled again
+      // (publishLatestFrameToPoolLocked), where the memory allows them.
       wgpu::TextureDescriptor texDesc{};
       texDesc.format = props.format;
-      texDesc.usage = usage;
+      texDesc.usage =
+          usage | ((wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst) &
+                   props.usage);
       texDesc.size.width = static_cast<uint32_t>(w);
       texDesc.size.height = static_cast<uint32_t>(h);
       slot.texture = slot.memory.CreateTexture(&texDesc);
@@ -1061,11 +1140,50 @@ private:
     return slot.texture;
   }
 
-  void poolPresent() {
-    std::lock_guard<std::mutex> lock(_poolMutex);
+  // Caller holds _mutex: the frame is kept as the latest frame before the
+  // slot's access ends.
+  void poolPresentLocked() {
+    std::lock_guard<std::mutex> poolLock(_poolMutex);
     if (_currentRenderSlot < 0 || _renderPool == nullptr) {
       return;
     }
+    retainFrameLocked(_renderPool->slots[_currentRenderSlot].texture);
+    poolQueuePresentLocked();
+  }
+
+  // Show the latest frame in a pool that has just been enabled, as
+  // applyPendingAttach blits it onto a new surface. Caller holds _mutex.
+  void publishLatestFrameToPoolLocked() {
+    if (!_poolMode.load() || !_texture || _config.device == nullptr) {
+      return;
+    }
+    poolResize(static_cast<int>(_config.width),
+               static_cast<int>(_config.height));
+    std::lock_guard<std::mutex> poolLock(_poolMutex);
+    if (_pool == nullptr || _renderPool != nullptr) {
+      return;
+    }
+    int idx = -1;
+    for (size_t i = 0; i < _pool->slots.size(); i++) {
+      if (_pool->slots[i].state == SlotState::Free) {
+        idx = static_cast<int>(i);
+        break;
+      }
+    }
+    if (idx < 0) {
+      return;
+    }
+    auto &slot = _pool->slots[idx];
+    if ((slot.texture.GetUsage() & wgpu::TextureUsage::CopyDst) !=
+            wgpu::TextureUsage::CopyDst ||
+        slot.texture.GetFormat() != _texture.GetFormat()) {
+      return;
+    }
+    slot.state = SlotState::Rendering;
+    _renderPool = _pool;
+    _currentRenderSlot = idx;
+    poolBeginAccess(slot);
+    submitCopyLocked(_texture, slot.texture);
     poolQueuePresentLocked();
   }
 
@@ -1236,7 +1354,9 @@ private:
   wgpu::Surface _surface = nullptr;
   NativeSurfaceReleaser _releaser;
   NativeSurfaceDidPresent _didPresent;
-  // Offscreen fallback drawing buffer.
+  // The latest frame, held offscreen: rendered into while nothing can show it,
+  // or a copy of the last frame presented (see retainFrameLocked). Blitted onto
+  // the next surface that attaches, or published into a pool enabled again.
   wgpu::Texture _texture = nullptr;
   // Surface attached by the UI thread, awaiting adoption at a frame boundary.
   bool _hasPendingAttach = false;
@@ -1246,7 +1366,9 @@ private:
   NativeSurfaceDidPresent _pendingDidPresent;
   // Frame state: set by getCurrentTexture, cleared by presentFrame.
   bool _frameInFlight = false;
-  bool _acquiredFromSurface = false;
+  // The current frame's texture when it came from the attached surface; null
+  // for an offscreen or pool frame.
+  wgpu::Texture _acquiredSurfaceTexture = nullptr;
   // Bumped on every acquire, present, configure/reconfigure/unconfigure,
   // adoption, and detach. The deferred blit-present in applyPendingAttach
   // revalidates against it so it never presents a texture that stopped being
@@ -1295,6 +1417,9 @@ private:
   std::atomic<bool> _shutdown{false};
   uint32_t _genCounter = 0;
   std::function<void()> _poolFrameReady; // consumer wake-up, see setter
+  // Set by enablePool, consumed at the next frame boundary
+  // (applyPendingAttach). Guarded by _mutex.
+  bool _hasPendingPoolPublish = false;
 #endif
 };
 

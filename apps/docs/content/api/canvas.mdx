@@ -224,8 +224,18 @@ Requesting it on a device below API 29 silently uses `TextureView`.
 `opaque` applies to whichever view is selected: on a `SurfaceView` it picks
 `PixelFormat.OPAQUE` or `PixelFormat.TRANSLUCENT`, on a `TextureView` it calls
 `setOpaque`, and a `HardwareBufferView` always composites with alpha. Changing
-`opaque` at runtime updates the view in place; changing `surfaceType` or
-`zOrderOnTop` replaces the backing view.
+`opaque` at runtime updates the view in place, unless `surfaceType` is unset
+and the change moves the canvas between `SurfaceView` and `TextureView`; that,
+like changing `surfaceType` or `zOrderOnTop`, replaces the backing view.
+
+Android drops a surface's content with the surface: a `SurfaceView`'s when the
+app goes to the background, and any backing view's when it leaves the window
+(a screen covered by a native stack, a list item clipped by
+`removeClippedSubviews`) or is replaced. The canvas keeps a copy of each frame
+it presents, whichever view backs it, and shows it on the next surface or view,
+so a canvas that draws once keeps its content. That costs one texture copy per
+presented frame, on top of the copies in the table above, and one extra drawing
+buffer per canvas.
 
 The defaults composite correctly in React Native stacking order without
 further flags. Set `surfaceType` when you need a different trade-off:

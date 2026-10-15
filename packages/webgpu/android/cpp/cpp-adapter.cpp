@@ -229,6 +229,11 @@ Java_com_webgpu_WebGPUHardwareBufferView_nEnablePool(JNIEnv *env, jobject thiz,
   auto waker = std::make_shared<HardwareBufferViewWaker>(env, thiz);
   info->setPoolFrameReadyCallback([waker]() { (*waker)(); });
   info->enablePool(static_cast<int>(dpW), static_cast<int>(dpH));
+  // The latest frame is published into the pool at the next frame boundary;
+  // schedule a flush so a context that is not rendering still shows it.
+  if (manager != nullptr) {
+    manager->flushPendingSurfaceTransition(info);
+  }
 }
 
 // Keep the canvas-client (dp) size in sync on resize.

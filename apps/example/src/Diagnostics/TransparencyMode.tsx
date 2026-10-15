@@ -18,9 +18,11 @@ import {
 } from "./surfaceLifecycle";
 
 // Exercises every Android backing-view combination on one mounted Canvas:
-// opaque toggles in place, surfaceType/zOrderOnTop replace the child view and
-// blit the last frame across. Half-transparent red is cleared over a blue
-// stage with a yellow RN overlay on top:
+// opaque toggles in place unless it flips the view "auto" picks, and
+// surfaceType/zOrderOnTop replace the child view and blit the last frame
+// across. Pause rendering before switching to check that the paused frame
+// reaches the new view. Half-transparent red is cleared over a blue stage with
+// a yellow RN overlay on top:
 // - opaque: solid red, overlay visible.
 // - non-opaque TextureView (default): pink, overlay visible.
 // - non-opaque HardwareBufferView (opt-in, Android 10+): pink, overlay
@@ -47,6 +49,9 @@ export const TransparencyMode = () => {
   const [option, setOption] = useState(OPTIONS[0]);
   const [opaque, setOpaque] = useState(false);
   const [mounted, setMounted] = useState(true);
+  const [paused, setPaused] = useState(false);
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
   const [taps, setTaps] = useState(0);
 
   useEffect(() => {
@@ -63,12 +68,14 @@ export const TransparencyMode = () => {
         if (!running) {
           return;
         }
-        try {
-          drawClearFrame(device, ctx, frame++, CLEAR_COLOR);
-        } catch (e) {
-          append(`frame threw: ${(e as Error).message}`);
-          running = false;
-          return;
+        if (!pausedRef.current) {
+          try {
+            drawClearFrame(device, ctx, frame++, CLEAR_COLOR);
+          } catch (e) {
+            append(`frame threw: ${(e as Error).message}`);
+            running = false;
+            return;
+          }
         }
         setTimeout(tick, 200);
       };
@@ -86,7 +93,8 @@ export const TransparencyMode = () => {
           Half-transparent red over blue. HardwareBufferView and TextureView
           keep the yellow RN overlay visible. A SurfaceView on top blends over
           it. Options update the same mounted Canvas; use hide/show to test a
-          fresh mount.
+          fresh mount. Pause rendering, then switch views: the last frame must
+          carry over.
         </Text>
         <View style={styles.buttons}>
           {OPTIONS.map((value) => (
@@ -108,6 +116,11 @@ export const TransparencyMode = () => {
             testID="toggle-canvas"
             title={mounted ? "hide canvas" : "show canvas"}
             onPress={() => setMounted((value) => !value)}
+          />
+          <Button
+            testID="toggle-rendering"
+            title={paused ? "resume rendering" : "pause rendering"}
+            onPress={() => setPaused((value) => !value)}
           />
         </View>
         <Text testID="view-status" style={diagnosticStyles.description}>

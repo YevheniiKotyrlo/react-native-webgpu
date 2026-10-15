@@ -143,14 +143,27 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
   }
 
   @Override
-  public void surfaceCreated(Surface surface) {
+  public void surfaceCreated(Surface surface, long firstFrameToken) {
     float density = getResources().getDisplayMetrics().density;
     float width = getWidth() / density;
     float height = getHeight() / density;
     // Only a SurfaceView votes: it is a layer of its own, while a TextureView
     // draws into its window's layer.
     float maxRefreshRate = mAppliedKind == KIND_SURFACE_VIEW ? resolveMaxRefreshRate() : 0f;
-    onSurfaceCreate(surface, mContextId, width, height, maxRefreshRate);
+    onSurfaceCreate(surface, mContextId, width, height, maxRefreshRate, firstFrameToken);
+  }
+
+  /**
+   * The first frame was presented into the surface firstFrameToken names.
+   * Called from native on the thread that presented it.
+   */
+  @DoNotStrip
+  public void onFirstFramePresented(long firstFrameToken) {
+    post(() -> {
+      if (mView instanceof WebGPUSurfaceView) {
+        ((WebGPUSurfaceView) mView).onFirstFramePresented(firstFrameToken);
+      }
+    });
   }
 
   @Override
@@ -185,7 +198,8 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     int contextId,
     float width,
     float height,
-    float maxRefreshRate
+    float maxRefreshRate,
+    long firstFrameToken
   );
 
   @DoNotStrip

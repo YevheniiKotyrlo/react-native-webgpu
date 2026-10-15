@@ -60,15 +60,16 @@ export const FirstFrameHole = () => {
   const { log, append } = useDiagnosticLog();
   const [mount, setMount] = useState(0);
   const [configureHidden, setConfigureHidden] = useState(false);
+  const [mounted, setMounted] = useState(true);
 
   return (
     <View style={diagnosticStyles.container}>
       <View style={diagnosticStyles.controls}>
         <Text style={diagnosticStyles.description}>
-          An opaque canvas, a SurfaceView on Android, over a blue stage. Its
-          first frame, solid red, is drawn half a second after its device is
-          ready, and the stage should show until then: black means the window
-          showed the surface before it had a frame.
+          An opaque canvas over a blue stage. Its first frame, solid red, is
+          drawn half a second after its device is ready. The stage should show
+          until that frame, and again as soon as the canvas is unmounted: black
+          means the window opened a hole with no frame behind it.
         </Text>
         <View style={styles.buttons}>
           <Button
@@ -84,14 +85,21 @@ export const FirstFrameHole = () => {
               setMount((value) => value + 1);
             }}
           />
+          <Button
+            testID="toggle-mounted"
+            title={`mounted: ${mounted}`}
+            onPress={() => setMounted((value) => !value)}
+          />
         </View>
       </View>
       <View style={styles.stage}>
-        <ProbeCanvas
-          key={mount}
-          configureHidden={configureHidden}
-          append={append}
-        />
+        {mounted ? (
+          <ProbeCanvas
+            key={mount}
+            configureHidden={configureHidden}
+            append={append}
+          />
+        ) : null}
       </View>
       <ScrollView style={diagnosticStyles.log}>
         {log.map((line, i) => (

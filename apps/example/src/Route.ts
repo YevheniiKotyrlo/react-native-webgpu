@@ -1,5 +1,10 @@
 export type Routes = {
   Home: undefined;
+  FrameRateProbe: undefined;
+  FrameRateProbeUIThread: undefined;
+  FrameRateProbeDedicatedThread: undefined;
+  FrameRateProbeSmall: undefined;
+  FrameRateProbeSmallUIThread: undefined;
   HelloTriangle: undefined;
   HelloTriangleMSAA: undefined;
   ImageBlur: undefined;

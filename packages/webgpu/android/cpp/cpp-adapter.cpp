@@ -344,7 +344,7 @@ Java_com_webgpu_WebGPUView_switchToOffscreenSurface(JNIEnv *env, jobject thiz,
   auto &registry = rnwgpu::SurfaceRegistry::getInstance();
   if (auto info = registry.getSurfaceInfo(contextId)) {
     info->setFramePresentedCallback(nullptr);
-    info->switchToOffscreen();
+    info->detach();
   }
 }
 
@@ -375,7 +375,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onViewDestroyed(
   auto &registry = rnwgpu::SurfaceRegistry::getInstance();
   if (auto info = registry.getSurfaceInfo(contextId)) {
     info->setFramePresentedCallback(nullptr);
-    info->detachSurface();
+    info->detach();
   }
   registry.removeSurfaceInfo(contextId);
 }
@@ -469,6 +469,6 @@ Java_com_webgpu_WebGPUHardwareBufferView_nSwitchToOffscreen(JNIEnv *env,
   auto info = registry.getSurfaceInfo(contextId);
   if (info != nullptr) {
     info->setPoolFrameReadyCallback(nullptr);
-    info->switchToOffscreen();
+    info->detach();
   }
 }

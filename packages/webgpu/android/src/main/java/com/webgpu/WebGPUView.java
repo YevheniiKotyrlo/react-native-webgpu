@@ -30,6 +30,9 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
   // behind the draw the window has pending (see SurfaceRegistry.h).
   private final Handler mMainHandler = new Handler(Looper.getMainLooper());
   private final Runnable mPostedPresent = () -> presentPostedFrame(mContextId);
+  // Only a SurfaceView votes: a TextureView or HardwareBufferView is
+  // composited into the window, which votes for it.
+  private final SurfaceFrameRateVote mFrameRateVote = new SurfaceFrameRateVote(this);
 
   WebGPUView(Context context) {
     super(context);
@@ -140,8 +143,12 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     float density = getResources().getDisplayMetrics().density;
     float width = getWidth() / density;
     float height = getHeight() / density;
+    boolean votesFrameRate = mAppliedKind == KIND_SURFACE_VIEW;
+    if (votesFrameRate) {
+      mFrameRateVote.attach(surface);
+    }
     // A TextureView shows a new frame only when its window draws.
-    onSurfaceCreate(surface, mContextId, width, height, mAppliedKind == KIND_TEXTURE_VIEW);
+    onSurfaceCreate(surface, mContextId, width, height, mAppliedKind == KIND_TEXTURE_VIEW, votesFrameRate);
   }
 
   @Override
@@ -154,7 +161,18 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
 
   @Override
   public void surfaceOffscreen() {
+    // The surface is still valid here, so the vote can be taken back.
+    mFrameRateVote.detach();
     switchToOffscreenSurface(mContextId);
+  }
+
+  /**
+   * Called from native (SurfaceInfo::presentFrame) on the thread that
+   * presented a frame to the surface, only for a SurfaceView.
+   */
+  @DoNotStrip
+  void onFramePresented() {
+    mFrameRateVote.onFramePresented();
   }
 
   @Override
@@ -173,16 +191,21 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
    * view: the view dies with its Canvas, so it retires the registry entry.
    */
   public void destroy() {
+    mFrameRateVote.detach();
     onViewDestroyed(mContextId);
   }
 
+  // presentsBehindPendingDraw has native post a present made on the main
+  // thread through postPresentBehindPendingDraw(); reportPresents asks native
+  // to call onFramePresented() for each frame presented to this surface.
   @DoNotStrip
   private native void onSurfaceCreate(
     Surface surface,
     int contextId,
     float width,
     float height,
-    boolean presentsBehindPendingDraw
+    boolean presentsBehindPendingDraw,
+    boolean reportPresents
   );
 
   @DoNotStrip

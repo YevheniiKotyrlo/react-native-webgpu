@@ -147,24 +147,36 @@ Java_com_webgpu_WebGPUModule_onViewSnapshotBuffer(JNIEnv *env,
   callbacks->onFrame(std::move(frame));
 }
 
+extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceChanged(
+    JNIEnv *env, jobject thiz, jobject surface, jint contextId, jfloat width,
+    jfloat height) {
+  auto &registry = rnwgpu::SurfaceRegistry::getInstance();
+  if (auto info = registry.getSurfaceInfo(contextId)) {
+    info->resize(static_cast<int>(width), static_cast<int>(height));
+  }
+}
+
 namespace {
 
-// A no-argument void method of a view, called from native through a weak
-// reference, so that a view RN has dropped is not kept alive by a
-// SurfaceInfo that outlives it (the registry keeps the SurfaceInfo until
-// onDropViewInstance).
-struct WeakViewMethod {
+// Weak handle on a Java view and one of its no-argument methods, for native
+// threads to call into it: the fence waiter wakes a WebGPUHardwareBufferView
+// when a frame is ready, the presenting thread reports each frame a
+// SurfaceView shows, and a TextureView canvas presenting on the main thread
+// posts its present behind the window's pending draw. Holding the view weakly
+// means a view that RN has dropped is not kept alive by a SurfaceInfo that
+// outlives it (the registry keeps the SurfaceInfo until onDropViewInstance).
+struct WeakViewCall {
   jweak view = nullptr;
   jmethodID method = nullptr;
 
-  WeakViewMethod(JNIEnv *env, jobject thiz, const char *name) {
+  WeakViewCall(JNIEnv *env, jobject thiz, const char *methodName) {
     view = env->NewWeakGlobalRef(thiz);
     jclass cls = env->GetObjectClass(thiz);
-    method = env->GetMethodID(cls, name, "()V");
+    method = env->GetMethodID(cls, methodName, "()V");
     env->DeleteLocalRef(cls);
   }
 
-  ~WeakViewMethod() {
+  ~WeakViewCall() {
     // May run on any thread; ThreadScope attaches if needed.
     facebook::jni::ThreadScope scope;
     JNIEnv *env = facebook::jni::Environment::current();
@@ -173,8 +185,8 @@ struct WeakViewMethod {
     }
   }
 
-  // Returns whether the view was there to take the call. Called outside
-  // SurfaceInfo's locks.
+  // Returns whether the view was there to take the call. Called on a native
+  // thread, outside the SurfaceInfo locks.
   bool operator()() const {
     facebook::jni::ThreadScope scope;
     JNIEnv *env = facebook::jni::Environment::current();
@@ -197,18 +209,10 @@ struct WeakViewMethod {
 
 } // namespace
 
-extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceChanged(
-    JNIEnv *env, jobject thiz, jobject surface, jint contextId, jfloat width,
-    jfloat height) {
-  auto &registry = rnwgpu::SurfaceRegistry::getInstance();
-  if (auto info = registry.getSurfaceInfo(contextId)) {
-    info->resize(static_cast<int>(width), static_cast<int>(height));
-  }
-}
-
 extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
     JNIEnv *env, jobject thiz, jobject jSurface, jint contextId, jfloat width,
-    jfloat height, jboolean presentsBehindPendingDraw) {
+    jfloat height, jboolean presentsBehindPendingDraw,
+    jboolean reportPresents) {
   if (manager == nullptr) {
     return;
   }
@@ -224,7 +228,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
   auto surface = runtime.makeSurface(window);
   rnwgpu::NativeSurfacePresentPoster presentPoster;
   if (presentsBehindPendingDraw) {
-    auto postPresent = std::make_shared<WeakViewMethod>(
+    auto postPresent = std::make_shared<WeakViewCall>(
         env, thiz, "postPresentBehindPendingDraw");
     presentPoster = [postPresent]() { return (*postPresent)(); };
   }
@@ -237,6 +241,15 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onSurfaceCreate(
         ANativeWindow_release(static_cast<ANativeWindow *>(nativeSurface));
       },
       std::move(presentPoster));
+  // A SurfaceView asks to hear about each presented frame, for its refresh
+  // rate vote (WebGPUView.onFramePresented).
+  if (reportPresents) {
+    auto reporter =
+        std::make_shared<WeakViewCall>(env, thiz, "onFramePresented");
+    info->setFramePresentedCallback([reporter]() { (*reporter)(); });
+  } else {
+    info->setFramePresentedCallback(nullptr);
+  }
   // The attach is adopted at the next frame boundary by the rendering thread;
   // schedule a flush so contexts that are not currently rendering still pick
   // it up (and present their last offscreen frame).
@@ -257,6 +270,7 @@ Java_com_webgpu_WebGPUView_switchToOffscreenSurface(JNIEnv *env, jobject thiz,
                                                     jint contextId) {
   auto &registry = rnwgpu::SurfaceRegistry::getInstance();
   if (auto info = registry.getSurfaceInfo(contextId)) {
+    info->setFramePresentedCallback(nullptr);
     info->switchToOffscreen();
   }
 }
@@ -269,6 +283,7 @@ extern "C" JNIEXPORT void JNICALL Java_com_webgpu_WebGPUView_onViewDestroyed(
   // surface; see RNWebGPU::destroyContext for the ownership split.
   auto &registry = rnwgpu::SurfaceRegistry::getInstance();
   if (auto info = registry.getSurfaceInfo(contextId)) {
+    info->setFramePresentedCallback(nullptr);
     info->detachSurface();
   }
   registry.removeSurfaceInfo(contextId);
@@ -287,10 +302,7 @@ Java_com_webgpu_WebGPUHardwareBufferView_nEnablePool(JNIEnv *env, jobject thiz,
   auto info = registry.getSurfaceInfoOrCreate(
       contextId, rnwgpu::WebGPURuntime::shared().instance(),
       static_cast<int>(dpW), static_cast<int>(dpH));
-  // The native fence waiter wakes the UI thread through it when a frame is
-  // ready.
-  auto waker =
-      std::make_shared<WeakViewMethod>(env, thiz, "onNativeFrameReady");
+  auto waker = std::make_shared<WeakViewCall>(env, thiz, "onNativeFrameReady");
   info->setPoolFrameReadyCallback([waker]() { (*waker)(); });
   info->enablePool(static_cast<int>(dpW), static_cast<int>(dpH));
 }

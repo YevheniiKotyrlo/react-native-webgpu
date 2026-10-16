@@ -573,6 +573,9 @@ public:
     }
 #endif
     NativeSurfacePresentPoster presentPoster;
+#if defined(__ANDROID__)
+    std::function<void()> framePresented;
+#endif
     {
       std::unique_lock<std::shared_mutex> lock(_mutex);
       if (_surface && _acquiredFromSurface) {
@@ -584,6 +587,9 @@ public:
           }
         } else {
           _surface.Present();
+#if defined(__ANDROID__)
+          framePresented = _framePresented;
+#endif
         }
       }
       _acquiredFromSurface = false;
@@ -593,6 +599,11 @@ public:
     if (presentPoster && !presentPoster()) {
       presentPostedFrame();
     }
+#if defined(__ANDROID__)
+    if (framePresented) {
+      framePresented();
+    }
+#endif
     applyPendingAttach();
   }
 
@@ -734,6 +745,16 @@ public:
   void setPoolFrameReadyCallback(std::function<void()> cb) {
     std::lock_guard<std::mutex> poolLock(_poolMutex);
     _poolFrameReady = std::move(cb);
+  }
+
+  // Invoked from the presenting thread (never under _mutex) after each frame
+  // presentFrame() shows on the attached surface; the blit of the last
+  // offscreen frame onto a newly attached surface does not count. The view
+  // uses it to vote the display's refresh rate while the canvas animates
+  // (see SurfaceFrameRateVote.java). Pass nullptr to unregister.
+  void setFramePresentedCallback(std::function<void()> cb) {
+    std::unique_lock<std::shared_mutex> lock(_mutex);
+    _framePresented = std::move(cb);
   }
 #endif
 
@@ -1319,6 +1340,9 @@ private:
 
   static constexpr int kPoolSize =
       5; // 2 held + 1 rendering + 1 waiting + 1 ready
+
+  // See setFramePresentedCallback(); read under _mutex, called outside it.
+  std::function<void()> _framePresented;
 
   std::atomic<bool> _poolMode{false};
   std::mutex _poolMutex;

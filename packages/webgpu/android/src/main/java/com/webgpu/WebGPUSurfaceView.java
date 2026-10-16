@@ -3,6 +3,7 @@ package com.webgpu;
 import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.PixelFormat;
+import android.os.Build;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
@@ -28,7 +29,7 @@ public class WebGPUSurfaceView extends SurfaceView implements SurfaceHolder.Call
     public void removeCallbacks(Runnable action) {
       WebGPUSurfaceView.this.removeCallbacks(action);
     }
-  });
+  }, Build.VERSION.SDK_INT);
 
   public WebGPUSurfaceView(Context context, WebGPUAPI api, boolean zOrderOnTop, boolean opaque) {
     super(context);

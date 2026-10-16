@@ -2,6 +2,8 @@ package com.webgpu;
 
 import static org.junit.Assert.assertEquals;
 
+import android.os.Build;
+
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -38,7 +40,7 @@ public class FirstFrameDrawGateTest {
 
   private final List<String> mReported = new ArrayList<>();
   private final ManualClock mClock = new ManualClock();
-  private final FirstFrameDrawGate mGate = new FirstFrameDrawGate(mClock);
+  private final FirstFrameDrawGate mGate = new FirstFrameDrawGate(mClock, Build.VERSION_CODES.TIRAMISU);
 
   private Runnable draw(String name) {
     return () -> mReported.add(name);
@@ -101,14 +103,16 @@ public class FirstFrameDrawGateTest {
   }
 
   @Test
-  public void detachingDropsPendingDrawsWithoutReportingThem() {
+  public void detachingReportsPendingDrawsOnce() {
     mGate.onSurfaceCreated(FIRST_SURFACE);
-    mGate.onRedrawNeeded(draw("dropped"));
+    mGate.onRedrawNeeded(draw("held"));
     mGate.onDetachedFromWindow();
+    assertEquals(Arrays.asList("held"), mReported);
+
     mGate.onSurfaceReleased();
     mGate.onFirstFramePresented(FIRST_SURFACE);
     mClock.elapse();
-    assertEquals(Arrays.asList(), mReported);
+    assertEquals(Arrays.asList("held"), mReported);
   }
 
   @Test
@@ -155,9 +159,23 @@ public class FirstFrameDrawGateTest {
   @Test
   public void detachingCancelsTheDeadline() {
     mGate.onSurfaceCreated(FIRST_SURFACE);
-    mGate.onRedrawNeeded(draw("dropped"));
+    mGate.onRedrawNeeded(draw("held"));
     mGate.onDetachedFromWindow();
     assertEquals(0, mClock.posted.size());
+  }
+
+  @Test
+  public void fromAndroid14ADrawWaitsForTheFirstFrameWithNoDeadline() {
+    FirstFrameDrawGate gate = new FirstFrameDrawGate(mClock, Build.VERSION_CODES.UPSIDE_DOWN_CAKE);
+    gate.onSurfaceCreated(FIRST_SURFACE);
+    gate.onRedrawNeeded(draw("held"));
+    assertEquals(0, mClock.posted.size());
+
+    mClock.elapse();
+    assertEquals(Arrays.asList(), mReported);
+
+    gate.onFirstFramePresented(FIRST_SURFACE);
+    assertEquals(Arrays.asList("held"), mReported);
   }
 
   @Test

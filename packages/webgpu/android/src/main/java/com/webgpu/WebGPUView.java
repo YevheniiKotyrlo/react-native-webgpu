@@ -2,6 +2,7 @@ package com.webgpu;
 
 import android.content.Context;
 import android.os.Build;
+import android.os.Looper;
 import android.view.Surface;
 import android.view.View;
 
@@ -134,7 +135,7 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
   }
 
   @Override
-  public void surfaceCreated(Surface surface) {
+  public void surfaceCreated(Surface surface, long firstFrameToken) {
     float density = getResources().getDisplayMetrics().density;
     float width = getWidth() / density;
     float height = getHeight() / density;
@@ -142,7 +143,28 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     if (votesFrameRate) {
       mFrameRateVote.attach(surface);
     }
-    onSurfaceCreate(surface, mContextId, width, height, votesFrameRate);
+    onSurfaceCreate(surface, mContextId, width, height, votesFrameRate, firstFrameToken);
+  }
+
+  /**
+   * The first frame was presented into the surface firstFrameToken names.
+   * Called from native on the thread that presented it, which is the main
+   * thread when the surface is adopted as it arrives: delivered at once there,
+   * so the hole opens in the window frame being drawn, and posted otherwise.
+   */
+  @DoNotStrip
+  public void onFirstFramePresented(long firstFrameToken) {
+    if (Looper.myLooper() == Looper.getMainLooper()) {
+      deliverFirstFramePresented(firstFrameToken);
+    } else {
+      post(() -> deliverFirstFramePresented(firstFrameToken));
+    }
+  }
+
+  private void deliverFirstFramePresented(long firstFrameToken) {
+    if (mView instanceof WebGPUSurfaceView) {
+      ((WebGPUSurfaceView) mView).onFirstFramePresented(firstFrameToken);
+    }
   }
 
   @Override
@@ -191,7 +213,8 @@ public class WebGPUView extends ReactViewGroup implements WebGPUAPI {
     int contextId,
     float width,
     float height,
-    boolean reportAnimation
+    boolean reportAnimation,
+    long firstFrameToken
   );
 
   @DoNotStrip

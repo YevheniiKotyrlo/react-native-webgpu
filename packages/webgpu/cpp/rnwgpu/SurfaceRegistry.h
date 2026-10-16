@@ -143,14 +143,15 @@ struct AHBPool {
 //   middle of a frame. For contexts that are not actively rendering,
 //   RNWebGPUManager::flushPendingSurfaceTransition applies the attach from the
 //   JS thread instead.
-// - Detaching (switchToOffscreen) is IMMEDIATE, because the platform destroys
-//   the surface as soon as its callback returns. A configured context falls
-//   back to rendering into an offscreen texture, so a running render loop
-//   keeps working; the in-flight frame, if any, is dropped at present(). When
-//   a new surface attaches, the latest offscreen frame is blitted onto it so
-//   content appears without waiting for the next render — the same mechanism
-//   that gives a fast time-to-first-frame when rendering starts before the
-//   native surface exists.
+// - Detaching (detach) is IMMEDIATE, because the platform destroys the
+//   surface as soon as its callback returns. A configured context renders the
+//   frames that follow into an offscreen texture, created with the first of
+//   them, so a running render loop keeps working; the in-flight frame, if
+//   any, is dropped at present(). When a new surface attaches, the latest
+//   offscreen frame is blitted onto it so content appears without waiting for
+//   the next render — the same mechanism that gives a fast time-to-first-frame
+//   when rendering starts before the native surface exists. A surface that
+//   attaches before any frame was rendered offscreen is presented nothing.
 class SurfaceInfo {
 public:
   SurfaceInfo(wgpu::Instance gpu, int width, int height)
@@ -213,16 +214,6 @@ public:
       replacedReleaser(replacedSurface);
     }
   }
-
-  // The platform surface is being destroyed: detach immediately. If the
-  // context is configured, rendering continues into an offscreen texture whose
-  // content is blitted to the next attached surface; present() no-ops until
-  // then. Safe to call when already offscreen.
-  void switchToOffscreen() { detach(/* createFallbackTexture = */ true); }
-
-  // Detach without creating the offscreen fallback: used when the context is
-  // being destroyed and nothing will consume further frames.
-  void detachSurface() { detach(/* createFallbackTexture = */ false); }
 
   // Reflects native view layout changes. Does not resize the drawing buffer:
   // that tracks canvas.width/height (like on the web), see
@@ -715,8 +706,11 @@ public:
   }
 #endif
 
-private:
-  void detach(bool createFallbackTexture) {
+  // The platform surface is being destroyed, or the view with it: detach
+  // immediately. A configured context renders on into an offscreen texture,
+  // whose latest frame the next attached surface gets; present() no-ops until
+  // then. Safe to call when already offscreen.
+  void detach() {
     void *releasedSurfaces[2] = {nullptr, nullptr};
     NativeSurfaceReleaser releasers[2];
     NativeSurfaceDidPresent releasedDidPresents[2];
@@ -728,8 +722,8 @@ private:
       std::unique_lock<std::shared_mutex> lock(_mutex);
 #if defined(__ANDROID__)
       // Leaving pool mode (the WebGPUHardwareBufferView detached): drop the
-      // pool. A configured context keeps rendering into the offscreen
-      // fallback, exactly like the surface path.
+      // pool. A configured context keeps rendering offscreen, exactly like the
+      // surface path.
       if (_poolMode.load()) {
         _poolMode.store(false);
         {
@@ -750,9 +744,6 @@ private:
           releasedFrameReady = std::move(_poolFrameReady);
           _poolFrameReady = nullptr;
         }
-        if (createFallbackTexture && _config.device != nullptr && !_texture) {
-          _texture = createOffscreenTextureLocked();
-        }
         _frameEpoch++;
       }
 #endif
@@ -767,9 +758,6 @@ private:
         _pendingNativeSurface = nullptr;
       }
       if (_surface) {
-        if (createFallbackTexture && _config.device != nullptr) {
-          _texture = createOffscreenTextureLocked();
-        }
         _surface = nullptr;
 #if defined(__ANDROID__)
         // DAWN_WORKAROUND_DEVICE_DESTROY_BEFORE_SURFACE_RELEASE
@@ -795,6 +783,7 @@ private:
     }
   }
 
+private:
   // All *Locked helpers below require _mutex to be held exclusively.
 
   // Returns the surface's didPresent callback when the present succeeded, for
@@ -1191,7 +1180,7 @@ private:
       std::function<void()> frameReady;
       {
         std::lock_guard<std::mutex> lock(_poolMutex);
-        // Pool torn down (switchToOffscreen) while this frame was in flight:
+        // Pool torn down (detach) while this frame was in flight:
         // discard it now that its fences have been drained. Publishing it would
         // pin the retired generation forever (nothing polls anymore).
         if (_pool == nullptr) {

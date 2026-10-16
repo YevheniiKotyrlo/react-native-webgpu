@@ -1344,13 +1344,11 @@ public:
   // an entry that a concurrent destroyContext is erasing (it either marks the
   // entry attached before the check, or re-creates the entry after the
   // erase). Lock order is registry -> SurfaceInfo, matching every other path.
-  std::shared_ptr<SurfaceInfo> attachSurface(int id, wgpu::Instance gpu,
-                                             int width, int height,
-                                             void *nativeSurface,
-                                             wgpu::Surface surface,
-                                             NativeSurfaceReleaser releaser,
-                                             NativeSurfaceFirstPresent
-                                                 firstPresent = nullptr) {
+  std::shared_ptr<SurfaceInfo>
+  attachSurface(int id, wgpu::Instance gpu, int width, int height,
+                void *nativeSurface, wgpu::Surface surface,
+                NativeSurfaceReleaser releaser,
+                NativeSurfaceFirstPresent firstPresent = nullptr) {
     std::unique_lock<std::shared_mutex> lock(_mutex);
     auto info = getSurfaceInfoOrCreateLocked(id, gpu, width, height);
     info->attachSurface(nativeSurface, std::move(surface), std::move(releaser),
